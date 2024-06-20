@@ -1,3 +1,5 @@
+"use strict";
+
 define([
   "jquery",
   "underscore",
@@ -21,7 +23,13 @@ define([
   LoadingTemplate,
   QualityReport,
 ) => {
-  "use strict";
+
+
+  // User facing messages used in this view
+  const STRINGS = {
+    notFound: "The assessment report for this dataset is not ready yet, it is in the queue to be generated. Try checking back in 24 hours to see these results.",
+    error: "There was an error retrieving or generating the assessment report for this dataset."
+  };
 
   /**
    * @class MdqRunView
@@ -93,6 +101,10 @@ define([
        */
       loadingContainer: "#mdqResult",
 
+      initialize() {
+        this.serviceUrl = MetacatUI.appModel.get("mdqRunsServiceUrl");
+      },
+
       /**
        * Switch the suite to the one selected by the user
        * @param {Event} event The event that triggered this function
@@ -101,8 +113,9 @@ define([
       switchSuite(event) {
         const select = $(event.target);
         const suiteId = $(select).val();
+        const encodedPid = encodeURIComponent(this.pid);
         MetacatUI.uiRouter.navigate(
-          `quality/s=${suiteId}/${encodeURIComponent(this.pid)}`,
+          `quality/s=${suiteId}/${encodedPid}`,
           { trigger: false },
         );
         this.suiteId = suiteId;
@@ -112,7 +125,17 @@ define([
 
       /** @inheritdoc */
       render() {
-        const viewRef = this;
+
+        // Insert the basic template
+        this.$el.html(this.template({}));
+
+        // Show breadcrumbs leading back to the dataset & data search
+        this.insertBreadcrumbs();
+
+        if (!this.pid || !this.serviceUrl) {
+          this.showNoPidMessage();
+          return;
+        }
 
         // The suite use for rendering can initially be set via the theme AppModel.
         // If a suite id is request via the metacatui route, then we have to display that
@@ -124,116 +147,137 @@ define([
 
         this.suiteIdList = MetacatUI.appModel.get("mdqSuiteIds");
         this.suiteLabels = MetacatUI.appModel.get("mdqSuiteLabels");
-        // this.url = this.mdqRunsServiceUrl + "/" + this.suiteId + "/" + this.pid;
 
-        // Insert the basic template
-        this.$el.html(this.template({}));
-        // Show breadcrumbs leading back to the dataset & data search
-        this.insertBreadcrumbs();
         // Insert the loading image
         this.showLoading();
 
-        if (!this.pid) {
-          const searchLink = $(document.createElement("a"))
-            .attr("href", `${MetacatUI.root}/data`)
-            .text("Search our database");
-          const message = $(document.createElement("span"))
-            .text(" to see an assessment report for a dataset")
-            .prepend(searchLink);
-          this.showMessage(message, true, false);
-          return;
+        const qualityReport = new QualityReport([], { pid: this.pid });
+        this.qualityReport = qualityReport;
+        this.setListeners();
+
+        const qualityUrl = `${this.serviceUrl}${this.suiteId}/${this.pid}`;
+        this.qualityReport.fetch({ url: qualityUrl });
+
+      },
+
+      /**
+       * Show a message indicating that no PID was provided
+       * @since 0.0.0
+       */
+      showNoPidMessage() {
+        const searchLink = $(document.createElement("a"))
+          .attr("href", `${MetacatUI.root}/data`)
+          .text("Search our database");
+        const message = $(document.createElement("span"))
+          .text(" to see an assessment report for a dataset")
+          .prepend(searchLink);
+        this.showMessage(message, true, false);
+      },
+
+
+      setListeners() {
+        this.listenToOnce(this.qualityReport, "fetchError", this.handleFetchError);
+        this.listenToOnce(this.qualityReport, "fetchComplete", this.handleFetchComplete);
+      },
+
+      removeListeners() {
+        this.stopListening(this.qualityReport);
+      },
+
+      /**
+       * Inspect the results to see if a quality report was returned. If not,
+       * then submit a request to the quality engine to create the quality
+       * report for this pid/suiteId, and inform the user of this.
+       * @param {QualityReport} qualityReport The quality report collection
+       */
+      handleFetchError() {
+
+        const { qualityReport } = this;
+        this.removeListeners();
+
+        let msgText;
+        const { runStatus, timestamp, fetchResponse } = qualityReport;
+        const { status } = fetchResponse;
+        const statusText = qualityReport.errorDescription || fetchResponse.statusText;
+
+        if (status === 404 || runStatus === "queued") {
+          msgText = STRINGS.notFound;
+          if (timestamp) {
+            msgText += ` The report was requested at: ${timestamp}`;
+          }
+        } else {
+          msgText = STRINGS.error;
+          if (statusText) {
+            msgText += `The Assessment Server reported this error: ${statusText}`;
+          }
         }
 
-        // Fetch a quality report from the quality server and display it.
-        const qualityUrl =
-          `${MetacatUI.appModel.get("mdqRunsServiceUrl") +
-          viewRef.suiteId
-          }/${viewRef.pid}`;
-        const qualityReport = new QualityReport([], {
-          url: qualityUrl,
-          pid: viewRef.pid,
-        });
-        qualityReport.fetch({ url: qualityUrl });
+        this.showMessage(msgText);
 
-        this.listenToOnce(qualityReport, "fetchError", () => {
-          // Inspect the results to see if a quality report was returned.
-          // If not, then submit a request to the quality engine to create the
-          // quality report for this pid/suiteId, and inform the user of this.
-          let msgText;
-          if (qualityReport.fetchResponse.status === 404) {
-            msgText =
-              "The assessment report for this dataset is not ready yet. Try checking back in 24 hours to see these results.";
-          } else {
-            msgText =
-              "There was an error retrieving the assessment report for this dataset.";
-            if (
-              typeof qualityReport.fetchResponse.statusText !== "undefined" &&
-              typeof qualityReport.fetchResponse.status !== "undefined"
-            ) {
-              if (qualityReport.fetchResponse.status !== 0)
-                  msgText +=
-                      `Error details: ${qualityReport.fetchResponse.statusText}`;
+      },
+
+      /**
+       * Handle the completion of the fetch request
+       * @since 0.0.0
+       */
+      handleFetchComplete() {
+
+        const { qualityReport } = this;
+        this.removeListeners();
+
+        if (qualityReport.runStatus !== "success") {
+          this.handleFetchError();
+          return;
+        }
+        this.renderResults();
+      },
+
+      /**
+       * Render the results of the quality report once it has been successfully
+       * fetched
+       * @since 0.0.0
+       */
+      renderResults() {
+
+        this.hideLoading();
+        const { qualityReport } = this;
+
+        // Filter out the checks with level 'METADATA', as these checks are
+        // intended to pass info to metadig-engine indexing (for search,
+        // faceting), and not intended for display.
+        qualityReport.reset(
+          _.reject(qualityReport.models, (model) => {
+            const check = model.get("check");
+            if (check.level === "METADATA") {
+              return true;
             }
-          }
-          this.showMessage(msgText);
-        });
-        
-        this.listenToOnce(qualityReport, "fetchComplete", () => {
-          let msgText;
-          if (qualityReport.runStatus !== "success") {
-            if (qualityReport.runStatus === "failure") {
-              msgText =
-                `There was an error generating the assessment report. The Assessment Server reported this error: ${qualityReport.errorDescription}`;
-            } else if (qualityReport.runStatus === "queued") {
-              msgText =
-                `The assessment report is in the Assessment Server queue to be generated. It was queued at: ${qualityReport.timestamp}`;
-            } else {
-              msgText =
-                "There was an error retrieving the assessment report.";
-            }
-            this.showMessage(msgText);
-            return;
-          }
-          viewRef.hideLoading();
+            return false;
+          }),
+        );
 
+        const groupedResults = qualityReport.groupResults(
+          qualityReport.models,
+        );
+        const groupedByType = qualityReport.groupByType(qualityReport.models);
 
-          // Filter out the checks with level 'METADATA', as these checks are intended
-          // to pass info to metadig-engine indexing (for search, faceting), and not intended for display.
-          qualityReport.reset(
-            _.reject(qualityReport.models, (model) => {
-              const check = model.get("check");
-              if (check.level === "METADATA") {
-                return true;
-              }
-              return false;
+        const data = {
+          objectIdentifier: qualityReport.id,
+          suiteId: this.suiteId,
+          suiteIdList: this.suiteIdList,
+          suiteLabels: this.suiteLabels,
+          groupedResults,
+          groupedByType,
+          timestamp: _.now(),
+          id: this.pid,
+          checkCount: qualityReport.length,
+        };
 
-            }),
-          );
-
-          const groupedResults = qualityReport.groupResults(
-            qualityReport.models,
-          );
-          const groupedByType = qualityReport.groupByType(qualityReport.models);
-
-          const data = {
-            objectIdentifier: qualityReport.id,
-            suiteId: viewRef.suiteId,
-            suiteIdList: viewRef.suiteIdList,
-            suiteLabels: viewRef.suiteLabels,
-            groupedResults,
-            groupedByType,
-            timestamp: _.now(),
-            id: viewRef.pid,
-            checkCount: qualityReport.length,
-          };
-
-          viewRef.$el.html(viewRef.template(data));
-          viewRef.insertBreadcrumbs();
-          viewRef.drawScoreChart(qualityReport.models, groupedResults);
-          viewRef.showCitation();
-          viewRef.show();
-          viewRef.$(".popover-this").popover();
-        });
+        this.$el.html(this.template(data));
+        this.insertBreadcrumbs();
+        this.drawScoreChart(qualityReport.models, groupedResults);
+        this.showCitation();
+        this.show();
+        this.$(".popover-this").popover();
       },
 
       /**
@@ -420,6 +464,10 @@ define([
         this.$(".format-charts-data").html(donut.render().el);
       },
 
+      /**
+       * Insert breadcrumbs leading back to the dataset and search
+       * @since 0.0.0
+       */
       insertBreadcrumbs() {
         const breadcrumbs = $(document.createElement("ol"))
           .addClass("breadcrumb")
@@ -430,7 +478,7 @@ define([
                 $(document.createElement("a"))
                   .attr("href", MetacatUI.root ? MetacatUI.root : "/")
                   .addClass("home")
-                  .text("Home"),
+                  .text("Home"),  
               ),
           )
           .append(
